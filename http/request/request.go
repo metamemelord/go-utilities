@@ -29,21 +29,20 @@ type byteReaderCloser struct {
 
 func (byteReaderCloser) Close() error { return nil }
 
-func New(logger *log.Logger) *httpRequest {
+func New(logger *log.Logger) (*httpRequest, error) {
 	request, err := http.NewRequest("", "", nil)
+
 	if err != nil {
-		if logger != nil {
-			logger.Error("[ERROR] Failed to create a http request")
-		}
-		return nil
+		return nil, err
 	}
+
 	return &httpRequest{
 		request: request,
 		header:  make(map[string]string),
-		retries: 4, // 1 + 3 retries. Leaving for now, will need to be properly piped into a worker with retires treated as a seperate action
+		retries: 0,
 		timeout: 30 * time.Second,
 		logger:  logger,
-	}
+	}, nil
 }
 
 func (h *httpRequest) SetContext(ctx context.Context) *httpRequest {
@@ -76,7 +75,7 @@ func (h *httpRequest) SetURI(uri string) *httpRequest {
 }
 
 func (h *httpRequest) SetPayloadFromReader(reader io.ReadCloser) *httpRequest {
-	h.reqest.Body = reader
+	h.request.Body = reader
 	return h
 }
 
@@ -109,11 +108,10 @@ func (h *httpRequest) SetRetries(retries uint8) *httpRequest {
 }
 
 func (h *httpRequest) Do() (*http.Response, error) {
-	if h.request.URL.String() == constants.EmptyString {
+	if h.request.URL.String() == "" {
 		return nil, fmt.Errorf("Request URI must be specified")
 	}
 
-	retries := h.retries
 	client := &http.Client{Timeout: h.timeout}
 
 	if (h.payload == nil || len(h.payload) == 0) && h.request.Body != nil {
@@ -126,34 +124,25 @@ func (h *httpRequest) Do() (*http.Response, error) {
 		h.payload = requestPayload
 	}
 
-	for retries != 0 {
-		retries--
+	response, err := client.Do(h.request)
+	if h.retries == 0 {
+		return response, err
+	}
 
-		response, err := client.Do(h.request)
+	var retries uint8 = 1
+	log.Println("[INFO]: Starting retries...")
+	for retries <= h.retries {
+		response, err = client.Do(h.request)
 		if err != nil {
 			if urlError, ok := err.(*url.Error); ok {
 				if urlError.Timeout() {
-					if h.logger != nil {
-						h.logger.WithFields(getRequestFields(h.request.Method,
-							h.request.URL.RequestURI(),
-							string(h.payload),
-							h.header,
-							fmt.Errorf("Call failed at retry number %d", h.retries-retries-1))).
-							Errorln("Request timed out")
-					}
-					continue
+					log.Println("[ERROR]: Request timed out")
 				}
 			} else {
-				if h.logger != nil {
-					err = multierr.Append(err, fmt.Errorf("Call failed at retry number %d", h.retries-retries-1))
-					h.logger.WithFields(getRequestFields(h.request.Method,
-						h.request.URL.RequestURI(),
-						string(h.payload),
-						h.header,
-						err)).
-						Errorf("API call failed")
-				}
+				err = multierr.Append(err, fmt.Errorf("Call failed at retry number %d", retries))
+				log.Println("[ERROR]:", err)
 			}
+			retries++
 			continue
 		}
 
@@ -166,47 +155,8 @@ func (h *httpRequest) Do() (*http.Response, error) {
 		responseBodyReader := bytes.NewReader(responsePayload)
 		response.Body = byteReaderCloser{responseBodyReader}
 
-		if h.logger != nil {
-			logFieldMap := getRequestFiel(h.request.Method,
-				h.request.URL.RequestURI(),
-				string(h.payload),
-				h.header,
-				nil)
-			logFieldMap["http.response.payload"] = string(responsePayload)
-			logFieldMap["http.response.code"] = response.StatusCode
-			h.logger.WithFields(logFieldMap).
-				Infof("API call successful")
-		}
 		return response, nil
 	}
 
-	if h.logger != nil {
-		h.logger.WithFields(getRequestFields(h.request.Method,
-			h.request.URL.RequestURI(),
-			string(h.payload),
-			h.header,
-			fmt.Errorf("Calls failed after %d reties", h.retries))).
-			Errorf("API call failed")
-	}
 	return nil, fmt.Errorf("Request failed")
-}
-
-func getRequestFields(method, uri, payload string, headers map[string]string, err error) logger.Fields {
-	fields := logger.Fields{}
-	if method != "" {
-		fields["http.request.method"] = method
-	}
-	if uri != "" {
-		fields["http.request.uri"] = uri
-	}
-	if payload != "" {
-		fields["http.request.payload"] = payload
-	}
-	if headers != nil {
-		fields["http.request.headers"] = headers
-	}
-	if err != nil {
-		fields["error"] = err
-	}
-	return fields
 }
